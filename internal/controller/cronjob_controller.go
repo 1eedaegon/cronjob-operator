@@ -107,6 +107,7 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var failedJobs []*kbatchv1.Job
 	var mostRecentTime *time.Time
 
+	// job의 condition type이 completed거나 failed면서 coditionStatus true면 finished 처리
 	isJobFinished := func(job *kbatchv1.Job) (bool, kbatchv1.JobConditionType) {
 		for _, c := range job.Status.Conditions {
 			if (c.Type == kbatchv1.JobComplete || c.Type == kbatchv1.JobFailed) && c.Status == corev1.ConditionTrue {
@@ -117,6 +118,7 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// getScheduledTimeForJob
+	// 어노테이션에 scheduled-at이 붙어있으면 파싱, 없으면 nil
 	getScheduledTimeForJob := func(job *kbatchv1.Job) (*time.Time, error) {
 		timeRaw := job.Annotations[scheduledTimeAnnotation]
 		if len(timeRaw) == 0 {
@@ -129,6 +131,7 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return &timeParsed, nil
 	}
 
+	// job의 상태를 판단해서 activeJob, failedJob, successfulJobs 어레이에 넣는다.
 	for i, job := range childJobs.Items {
 		_, finishedType := isJobFinished(&job)
 		switch finishedType {
@@ -146,11 +149,13 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			continue
 		}
 		if scheduledTimeForJob != nil {
+			// scheduledTimeForJob보다 이전이거나 recenttime이 없으면 mostRecentime에 scheduledTimeForJob을 할당한다.
 			if mostRecentTime == nil || mostRecentTime.Before(*scheduledTimeForJob) {
 				mostRecentTime = scheduledTimeForJob
 			}
 		}
 	}
+
 	if mostRecentTime != nil {
 		cronJob.Status.LastScheduleTime = &metav1.Time{Time: *mostRecentTime}
 	} else {
@@ -191,6 +196,9 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 	}
+
+	// 3: Clean up old jobs according to the history limit
+	// 3. history limit 이 초과한 히스토리 job 삭제
 	if cronJob.Spec.FailedJobsHistoryLimit != nil {
 		sort.Slice(failedJobs, func(i, j int) bool {
 			if failedJobs[i] == nil {
@@ -209,17 +217,19 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 	}
+
+	// 4. cronjob의 spec이 suspend(중지중)이면 reconcile 스킵
 	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
 		log.V(1).Info("cronjob suspended, skipping")
 		return ctrl.Result{}, nil
 	}
 
+	// 5. 다음 scheduled job을 실행
 	getNextSchedule := func(cronJob *batchv1.CronJob, now time.Time) (lastMissed time.Time, next time.Time, err error) {
 		sched, err := cron.ParseStandard(cronJob.Spec.Schedule)
 		if err != nil {
 			return time.Time{}, time.Time{}, fmt.Errorf("Unparseable schedule %q: %v", cronJob.Spec.Schedule, err)
 		}
-
 		var earliestTime time.Time
 		if cronJob.Status.LastScheduleTime != nil {
 			earliestTime = cronJob.Status.LastScheduleTime.Time
@@ -235,15 +245,6 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if earliestTime.After(now) {
 			return time.Time{}, sched.Next(now), nil
 		}
-		/*
-			주의: 컨트롤러는 여러 번의 시작을 놓칠 수 있다.
-			예를 들어, 금요일 오후 5시 1분에 전직원이 퇴근 후 컨트롤러가 멈췄는데
-			누군가 화요일 오전에 문제를 발견하고 해결한다음 컨트롤러를 다시 시작하면
-			각 시간별 예약된 작업은 추가 개입 없이 모두 실행을 시작해야 한다.
-			하지만 어딘가에 버그가 있거나 컨트롤러 서버 또는 API 서버에 잘못된 클락이 있는 경우
-			시작 하지 못한 잡이 너무 많이 누적되어 CPU를 모두 소모할 수 있다.
-			TODO: time schedling with next clause
-		*/
 		starts := 0
 		for t := sched.Next(earliestTime); !t.After(now); t = sched.Next(t) {
 			lastMissed = t
@@ -262,37 +263,12 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Error(err, "unable to figure out CronJob schedule")
 		return ctrl.Result{}, nil
 	}
+
 	scheduledResult := ctrl.Result{RequeueAfter: nextRun.Sub(r.Now())}
 	log = log.WithValues("now", r.Now(), "next run", nextRun)
-	if missedRun.IsZero() {
-		log.V(1).Info("no upcomming scheduled times, sleeping until next")
-		return scheduledResult, nil
-	}
-	log = log.WithValues("current run", missedRun)
-	tooLate := false
-	if cronJob.Spec.StartingDeadlineSeconds != nil {
-		tooLate = missedRun.Add(time.Duration(*cronJob.Spec.StartingDeadlineSeconds) * time.Second).Before(r.Now())
-	}
-	if tooLate {
-		log.V(1).Info("missed starting deadline for last run, sleeping till next")
-		return scheduledResult, nil
-	}
 
-	if cronJob.Spec.ConcurrencyPolicy == batchv1.ForbidConcurrent && len(activeJobs) > 0 {
-		log.V(1).Info("concurrency policy blocks concurrent runs, skipping", "num active", len(activeJobs))
-		return scheduledResult, nil
-	}
-	if cronJob.Spec.ConcurrencyPolicy == batchv1.ReplaceConcurrent {
-		for _, activeJob := range activeJobs {
-			if err := r.Delete(ctx, activeJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-				log.Error(err, "unable to delete active job", "job", activeJob)
-				return ctrl.Result{}, err
-			}
-		}
-	}
 	constructJobForCronJob := func(cronJob *batchv1.CronJob, scheduleTime time.Time) (*kbatchv1.Job, error) {
 		name := fmt.Sprintf("%s-%d", cronJob.Name, scheduleTime.Unix())
-
 		job := &kbatchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels:      make(map[string]string),
@@ -302,7 +278,6 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			},
 			Spec: *cronJob.Spec.JobTemplate.Spec.DeepCopy(),
 		}
-
 		for k, v := range cronJob.Spec.JobTemplate.Annotations {
 			job.Annotations[k] = v
 		}
@@ -315,6 +290,7 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		return job, nil
 	}
+
 	job, err := constructJobForCronJob(&cronJob, missedRun)
 	if err != nil {
 		log.Error(err, "unable to construct job from template")
